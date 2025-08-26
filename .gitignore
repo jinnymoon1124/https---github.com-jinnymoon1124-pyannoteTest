@@ -1,2 +1,4 @@
 /audio/*
 /temp/*
+/embeddings/*
+__pycache__/
