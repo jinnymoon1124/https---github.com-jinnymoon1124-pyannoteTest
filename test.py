@@ -4,6 +4,10 @@ import GPUtil
 import time
 import threading
 import os
+import whisper
+import librosa
+import soundfile as sf
+from datetime import datetime
 
 def monitor_resources(stop_event):
     """시스템 리소스를 모니터링하는 함수"""
@@ -80,10 +84,93 @@ try:
     # 리소스 모니터링 중단
     stop_monitoring.set()
     
-    print("\n=== 화자 분리 결과 ===")
-    # 결과 출력
-    for turn, _, speaker in diarization.itertracks(yield_label=True):
-        print(f"start={turn.start:.1f}s stop={turn.end:.1f}s speaker_{speaker}")
+    print("\n=== 화자 분리 및 STT 처리 ===")
+    
+    # temp 폴더 생성
+    temp_dir = "temp"
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    # Whisper 모델 로딩 (한국어에 최적화된 large-v3 모델 사용)
+    print("Whisper STT 모델 로딩 중...")
+    whisper_model = whisper.load_model("large-v3")
+    if torch.cuda.is_available():
+        # Whisper 모델도 GPU로 이동
+        whisper_model = whisper_model.to(device)
+        print("Whisper 모델을 GPU로 이동했습니다.")
+    
+    # 원본 오디오 파일 로딩 (librosa 사용)
+    audio_data, sample_rate = librosa.load(audio_file, sr=None)
+    
+    # 현재 시간 (파일명용)
+    current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    print(f"\n화자별 음성 분리 및 텍스트 변환 시작...")
+    results = []
+    
+    # 각 화자별 구간을 처리
+    for i, (turn, _, speaker) in enumerate(diarization.itertracks(yield_label=True)):
+        start_sample = int(turn.start * sample_rate)
+        end_sample = int(turn.end * sample_rate)
+        
+        # 해당 구간의 오디오 추출
+        segment_audio = audio_data[start_sample:end_sample]
+        
+        # 파일명 생성: {현재시간}_{화자번호}_{구간번호}.wav
+        filename = f"{current_time}_{speaker}_{i+1:03d}.wav"
+        filepath = os.path.join(temp_dir, filename)
+        
+        # 오디오 세그먼트를 파일로 저장
+        sf.write(filepath, segment_audio, sample_rate)
+        
+        # Whisper를 사용하여 STT 수행
+        try:
+            result = whisper_model.transcribe(filepath, language="ko")
+            text = result["text"].strip()
+            
+            # 결과 저장
+            results.append({
+                "start": turn.start,
+                "end": turn.end,
+                "speaker": speaker,
+                "filename": filename,
+                "text": text
+            })
+            
+            print(f"[{i+1:2d}] {turn.start:.1f}s-{turn.end:.1f}s | {speaker} | {filename}")
+            print(f"     텍스트: {text}")
+            print()
+            
+        except Exception as e:
+            print(f"STT 처리 오류 ({filename}): {e}")
+            results.append({
+                "start": turn.start,
+                "end": turn.end,
+                "speaker": speaker,
+                "filename": filename,
+                "text": "[STT 처리 실패]"
+            })
+    
+    print(f"\n=== 처리 완료 ===")
+    print(f"총 {len(results)}개 구간 처리 완료")
+    print(f"분리된 오디오 파일들이 '{temp_dir}' 폴더에 저장되었습니다.")
+    
+    # 화자별 요약 출력
+    print(f"\n=== 화자별 발화 요약 ===")
+    speaker_texts = {}
+    for result in results:
+        speaker = result["speaker"]
+        if speaker not in speaker_texts:
+            speaker_texts[speaker] = []
+        speaker_texts[speaker].append(result["text"])
+    
+    for speaker, texts in speaker_texts.items():
+        print(f"\n[{speaker}]:")
+        for i, text in enumerate(texts, 1):
+            print(f"  {i}. {text}")
+    
+    print(f"\n전체 대화 내용:")
+    for result in results:
+        print(f"{result['start']:.1f}s [{result['speaker']}]: {result['text']}")
 
 except Exception as e:
     print(f"오류 발생: {e}")

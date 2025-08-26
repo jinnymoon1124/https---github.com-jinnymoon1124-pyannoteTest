@@ -3,3 +3,5 @@ psutil
 GPUtil
 torch
 torchaudio
+openai-whisper
+pydub
