@@ -2,3 +2,6 @@
 /temp/*
 /embeddings/*
 __pycache__/
+uploads/
+*.wav
+*.mp3

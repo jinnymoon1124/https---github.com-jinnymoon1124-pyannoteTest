@@ -40,11 +40,15 @@ def monitor_resources(stop_event):
         
         time.sleep(2)  # 2초마다 모니터링
 
-def extract_and_save_embeddings(pipeline, diarization, audio_file, results):
+def extract_and_save_embeddings(pipeline, diarization, audio_file, results, target_speakers=None):
     """
     화자별 임베딩 벡터를 추출하고 저장하는 함수
+    target_speakers: 저장할 대상 화자 리스트 (None이면 모든 화자)
     """
-    print("\n=== 화자 임베딩 추출 및 저장 ===")
+    if target_speakers:
+        print(f"\n=== 새로운 화자 임베딩 추출 및 저장 ({', '.join(target_speakers)}) ===")
+    else:
+        print("\n=== 화자 임베딩 추출 및 저장 ===")
     
     # 임베딩 저장 디렉토리 생성
     embeddings_dir = "embeddings"
@@ -68,6 +72,10 @@ def extract_and_save_embeddings(pipeline, diarization, audio_file, results):
             speaker = result["speaker"]
             start_time = result["start"]
             end_time = result["end"]
+            
+            # 대상 화자 필터링 (target_speakers가 지정된 경우)
+            if target_speakers and speaker not in target_speakers:
+                continue
             
             # 해당 구간의 오디오 추출
             start_sample = int(start_time * sample_rate)
@@ -239,6 +247,205 @@ def identify_speaker(new_embedding, known_profiles, threshold=0.8):
     else:
         return "UNKNOWN", best_similarity
 
+def verify_and_selective_embedding_save(pipeline, diarization, audio_file, results):
+    """
+    화자 사전 검증 후 새로운 화자에 대해서만 임베딩 저장하는 함수
+    1단계: 빠른 검증용 임베딩 추출 (대표 세그먼트만)
+    2단계: 기존 화자와 비교하여 새로운 화자 판별
+    3단계: 새로운 화자에 대해서만 전체 임베딩 추출 및 저장
+    """
+    print("🔍 화자 사전 검증 시작...")
+    
+    # 기존 화자 프로파일 로드
+    import glob
+    existing_profiles = {}
+    
+    try:
+        # 기존 프로파일 파일들 로드
+        profile_files = glob.glob("embeddings/*_profile.pkl")
+        
+        for profile_file in profile_files:
+            try:
+                with open(profile_file, 'rb') as f:
+                    profile = pickle.load(f)
+                    speaker_id = profile['speaker_id']
+                    existing_profiles[speaker_id] = profile
+                    print(f"✅ 기존 화자 로드: {speaker_id} ({profile['num_segments']}개 세그먼트)")
+            except Exception as e:
+                print(f"❌ 프로파일 로드 실패 ({profile_file}): {e}")
+        
+        if not existing_profiles:
+            print("📝 기존 등록된 화자가 없습니다. 모든 화자를 새로 등록합니다.")
+            # 모든 화자에 대해 임베딩 저장
+            speaker_embeddings, session_metadata = extract_and_save_embeddings(pipeline, diarization, audio_file, results)
+            
+            # 새로운 화자들에 대한 기본 정보 반환
+            verified_speakers = {}
+            for speaker_label in speaker_embeddings.keys():
+                verified_speakers[speaker_label] = {
+                    'identified_as': f"새로운_화자_{speaker_label}",
+                    'confidence': '신규등록',
+                    'similarity': 0.0,
+                    'is_known': False
+                }
+            
+            return verified_speakers, speaker_embeddings
+        
+        print(f"🔍 총 {len(existing_profiles)}명의 기존 화자와 사전 비교 중...")
+        
+        # 1단계: 각 화자별 대표 세그먼트로 빠른 검증
+        current_speakers = {}  # {speaker_label: [segments]}
+        for result in results:
+            speaker = result["speaker"]
+            if speaker not in current_speakers:
+                current_speakers[speaker] = []
+            current_speakers[speaker].append(result)
+        
+        verified_speakers = {}
+        speakers_to_save = []  # 새로운 화자들만 저장할 리스트
+        
+        for current_speaker, speaker_segments in current_speakers.items():
+            print(f"\n🎯 {current_speaker} 사전 검증 중...")
+            
+            # 가장 긴 세그먼트 선택 (대표성을 위해)
+            longest_segment = max(speaker_segments, key=lambda x: x['end'] - x['start'])
+            
+            # 대표 세그먼트만으로 임베딩 추출
+            representative_embedding = extract_single_segment_embedding(
+                pipeline, audio_file, longest_segment
+            )
+            
+            if representative_embedding is None:
+                print(f"   ❌ 대표 임베딩 추출 실패")
+                continue
+            
+            # 기존 화자들과 비교
+            best_match = None
+            best_similarity = 0
+            all_similarities = {}
+            
+            for existing_speaker, profile in existing_profiles.items():
+                existing_mean = profile['mean_embedding']
+                
+                # 코사인 유사도 계산
+                similarity = cosine_similarity(
+                    representative_embedding.reshape(1, -1), 
+                    existing_mean.reshape(1, -1)
+                )[0][0]
+                
+                all_similarities[existing_speaker] = similarity
+                
+                if similarity > best_similarity:
+                    best_similarity = similarity
+                    best_match = existing_speaker
+            
+            # 임계값 기준으로 판단 (0.6 사용)
+            threshold = 0.6
+            
+            if best_similarity >= threshold:
+                identified_as = best_match
+                confidence_level = "높음" if best_similarity >= 0.8 else "보통"
+                is_known = True
+                print(f"   ✅ 기존 화자 매칭: {best_match} (유사도: {best_similarity:.4f}, 신뢰도: {confidence_level})")
+                print(f"   💾 임베딩 저장 생략 - 기존 프로필 재사용")
+            else:
+                identified_as = f"새로운_화자_{current_speaker}"
+                confidence_level = "새로운화자"
+                is_known = False
+                speakers_to_save.append(current_speaker)
+                print(f"   ❓ 새로운 화자: {identified_as} (최고 유사도: {best_similarity:.4f})")
+                print(f"   💾 임베딩 저장 예정")
+            
+            # 상위 3개 유사도 출력
+            sorted_similarities = sorted(all_similarities.items(), key=lambda x: x[1], reverse=True)
+            print(f"   📊 유사도 순위:")
+            for i, (speaker, sim) in enumerate(sorted_similarities[:3], 1):
+                status = "✅" if sim >= threshold else "❌"
+                print(f"      {status} {i}위: {speaker} ({sim:.4f})")
+            
+            verified_speakers[current_speaker] = {
+                'identified_as': identified_as,
+                'confidence': confidence_level,
+                'similarity': best_similarity,
+                'is_known': is_known,
+                'all_similarities': all_similarities
+            }
+        
+        print(f"\n🎉 사전 검증 완료!")
+        print(f"📊 검증 결과 요약:")
+        known_count = sum(1 for v in verified_speakers.values() if v['is_known'])
+        new_count = len(verified_speakers) - known_count
+        print(f"   - 기존 화자: {known_count}명 (임베딩 저장 생략)")
+        print(f"   - 새로운 화자: {new_count}명 (임베딩 저장 진행)")
+        
+        # 2단계: 새로운 화자들에 대해서만 전체 임베딩 저장
+        new_speaker_embeddings = {}
+        
+        if speakers_to_save:
+            print(f"\n💾 새로운 화자들에 대한 임베딩 저장 시작...")
+            
+            # 새로운 화자들의 결과만 필터링
+            new_speaker_results = [r for r in results if r['speaker'] in speakers_to_save]
+            
+            # 임베딩 추출 및 저장 (새로운 화자들만)
+            new_speaker_embeddings, session_metadata = extract_and_save_embeddings(
+                pipeline, diarization, audio_file, new_speaker_results, speakers_to_save
+            )
+        
+        return verified_speakers, new_speaker_embeddings
+        
+    except Exception as e:
+        print(f"❌ 화자 사전 검증 중 오류 발생: {e}")
+        return {}, {}
+
+def extract_single_segment_embedding(pipeline, audio_file, segment_result):
+    """단일 세그먼트에 대한 임베딩 추출 (빠른 검증용)"""
+    try:
+        # 임베딩 모델 추출
+        embedding_model = pipeline._embedding
+        
+        # 오디오 데이터 로드
+        audio_data, sample_rate = librosa.load(audio_file, sr=16000)
+        
+        start_time = segment_result["start"]
+        end_time = segment_result["end"]
+        
+        # 해당 구간의 오디오 추출
+        start_sample = int(start_time * sample_rate)
+        end_sample = int(end_time * sample_rate)
+        segment_audio = audio_data[start_sample:end_sample]
+        
+        # 너무 짧은 세그먼트는 제외
+        if len(segment_audio) < sample_rate * 0.5:
+            return None
+        
+        # 임베딩 추출
+        if hasattr(embedding_model, 'model_'):
+            direct_model = embedding_model.model_
+        else:
+            from pyannote.audio import Model
+            model_path = "models/pyannote_model_wespeaker-voxceleb-resnet34-LM.bin"
+            direct_model = Model.from_pretrained(model_path)
+            if torch.cuda.is_available():
+                direct_model = direct_model.cuda()
+        
+        # 텐서 변환
+        audio_tensor = torch.from_numpy(segment_audio).float()
+        audio_tensor = audio_tensor.unsqueeze(0).unsqueeze(0)  # (1, 1, samples)
+        
+        if torch.cuda.is_available():
+            audio_tensor = audio_tensor.cuda()
+        
+        # 임베딩 추출
+        with torch.no_grad():
+            embedding = direct_model(audio_tensor)
+        
+        return embedding.cpu().numpy().flatten()
+        
+    except Exception as e:
+        print(f"❌ 단일 세그먼트 임베딩 추출 실패: {e}")
+        return None
+
 print("=== 화자 분리 프로세스 시작 ===")
 print("시스템 리소스 모니터링을 시작합니다...")
 
@@ -376,31 +583,56 @@ try:
     for result in results:
         print(f"{result['start']:.1f}s [{result['speaker']}]: {result['text']}")
     
-    # 임베딩 추출 및 저장
-    speaker_embeddings, session_metadata = extract_and_save_embeddings(pipeline, diarization, audio_file, results)
+    # 화자 사전 검증 및 선택적 임베딩 저장
+    print(f"\n=== 화자 사전 검증 및 선택적 임베딩 저장 ===")
+    verified_speakers, new_speaker_embeddings = verify_and_selective_embedding_save(pipeline, diarization, audio_file, results)
     
     # 저장된 임베딩 데이터 요약 출력
-    if speaker_embeddings:
-        print(f"\n=== 임베딩 저장 요약 ===")
-        for speaker, embeddings in speaker_embeddings.items():
-            print(f"{speaker}: {len(embeddings)}개 임베딩 벡터 저장")
+    if new_speaker_embeddings:
+        print(f"\n=== 새로운 화자 임베딩 저장 요약 ===")
+        for speaker, embeddings in new_speaker_embeddings.items():
+            print(f"{speaker}: {len(embeddings)}개 임베딩 벡터 저장 (신규)")
+    else:
+        print(f"\n📝 모든 화자가 기존 등록 화자로 확인되어 새로운 임베딩 저장이 생략되었습니다.")
         
-        # 임베딩 활용 예시 (기존 화자 프로파일 로드 테스트)
-        print(f"\n=== 저장된 프로파일 로드 테스트 ===")
-        loaded_profiles = load_speaker_embeddings()
-        
-        if loaded_profiles:
-            print(f"로드된 화자 프로파일: {list(loaded_profiles.keys())}")
+        # 검증된 화자 정보로 결과 업데이트
+        if verified_speakers:
+            print(f"\n=== 검증된 화자별 발화 요약 ===")
+            updated_speaker_texts = {}
             
-            # 화자 식별 테스트 (첫 번째 임베딩으로 테스트)
-            if results:
-                first_speaker = results[0]['speaker']
-                if first_speaker in speaker_embeddings and speaker_embeddings[first_speaker]:
-                    test_embedding = speaker_embeddings[first_speaker][0]['embedding']
-                    identified_speaker, similarity = identify_speaker(test_embedding, loaded_profiles, threshold=0.7)
-                    print(f"테스트 임베딩 식별 결과: {identified_speaker} (유사도: {similarity:.3f})")
+            for result in results:
+                original_speaker = result["speaker"]
+                verified_info = verified_speakers.get(original_speaker, {})
+                verified_name = verified_info.get('identified_as', original_speaker)
+                confidence = verified_info.get('confidence', 'unknown')
+                
+                if verified_name not in updated_speaker_texts:
+                    updated_speaker_texts[verified_name] = []
+                
+                # 결과에 검증 정보 추가
+                result['verified_speaker'] = verified_name
+                result['verification_confidence'] = confidence
+                updated_speaker_texts[verified_name].append({
+                    'text': result['text'],
+                    'time': f"{result['start']:.1f}s-{result['end']:.1f}s",
+                    'original_label': original_speaker
+                })
+            
+            # 검증된 화자별 요약 출력
+            for speaker_name, texts in updated_speaker_texts.items():
+                confidence_info = verified_speakers.get(speaker_name, {}).get('confidence', 'unknown')
+                print(f"\n[{speaker_name}] (신뢰도: {confidence_info}):")
+                for i, text_info in enumerate(texts, 1):
+                    print(f"  {i}. {text_info['text']} ({text_info['time']})")
+            
+            print(f"\n=== 검증된 전체 대화 내용 ===")
+            for result in results:
+                verified_speaker = result.get('verified_speaker', result['speaker'])
+                confidence = result.get('verification_confidence', 'unknown')
+                print(f"{result['start']:.1f}s [{verified_speaker}] ({confidence}): {result['text']}")
+        
         else:
-            print("로드된 프로파일이 없습니다.")
+            print("화자 검증 결과가 없습니다.")
 
 except Exception as e:
     print(f"오류 발생: {e}")
