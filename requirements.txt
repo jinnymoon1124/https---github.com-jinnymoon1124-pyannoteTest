@@ -1,0 +1,5 @@
+pyannote.audio
+psutil
+GPUtil
+torch
+torchaudio
