@@ -70,11 +70,11 @@ class BaseController:
             response['data'] = data
         return response
     
-    def error_response(self, error: str, status_code: int = 400) -> tuple:
+    def error_response(self, data: str = "실패", status_code: int = 400) -> tuple:
         """오류 응답 생성"""
         return jsonify({
             'success': False,
-            'error': error
+            'data': data
         }), status_code
     
     def invalid_param_response(self, param_name: str) -> tuple:

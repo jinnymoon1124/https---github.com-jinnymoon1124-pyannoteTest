@@ -70,6 +70,20 @@ class AudioController(BaseController):
                 total_time, diarization_time, stt_time, verify_time
             )
             
+            # 대화록 파일 저장
+            print("대화록 파일 저장 중...")
+            transcript_path = self.audio_service.save_transcript_to_file(
+                results, speaker_summary, verified_speakers, response_data["processing_info"]
+            )
+            
+            # 응답 데이터에 대화록 파일 경로 추가
+            if transcript_path:
+                response_data["transcript_file"] = {
+                    "path": transcript_path,
+                    "filename": os.path.basename(transcript_path),
+                    "message": "대화록이 파일로 저장되었습니다."
+                }
+            
             return jsonify(response_data)
             
         finally:
@@ -131,6 +145,23 @@ class AudioController(BaseController):
                 result["verification_confidence"] = verified_info['confidence']
                 result["similarity_score"] = float(verified_info['similarity'])
                 result["is_known_speaker"] = verified_info['is_known']
+                
+                # 화자 ID 정보 정리 (화자 이름 변경 시 사용할 ID)
+                if verified_info.get('new_speaker_id'):
+                    # 새로운 화자인 경우
+                    result["speaker_id"] = verified_info['new_speaker_id']
+                elif verified_info.get('matched_speaker_id'):
+                    # 기존 화자로 매칭된 경우
+                    result["speaker_id"] = verified_info['matched_speaker_id']
+                else:
+                    # fallback: 원본 화자 라벨 사용
+                    result["speaker_id"] = original_speaker
+                
+                # 원본 화자 라벨은 별도 필드로 보관 (디버깅용)
+                result["original_speaker_label"] = original_speaker
+                
+                # 기존 speaker 필드 제거 (혼동 방지)
+                del result["speaker"]
     
     def _build_response_data(self, results, speaker_summary, verified_speakers,
                            total_time, diarization_time, stt_time, verify_time):

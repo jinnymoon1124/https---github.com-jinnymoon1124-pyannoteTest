@@ -11,7 +11,9 @@ import librosa
 import soundfile as sf
 import pickle
 import numpy as np
+import json
 from datetime import datetime
+from collections import defaultdict
 from sklearn.metrics.pairwise import cosine_similarity
 from pyannote.audio import Pipeline
 import glob
@@ -212,36 +214,249 @@ class AudioProcessingService:
             print(f"❌ 단일 세그먼트 임베딩 추출 실패: {e}")
             return None
     
+    def get_next_speaker_id(self, embeddings_dir="temp/embeddings"):
+        """다음 사용 가능한 화자 ID를 반환 (SPEAKER_XX 형식)"""
+        try:
+            os.makedirs(embeddings_dir, exist_ok=True)
+            
+            # 기존 프로파일 파일들에서 사용된 ID 추출
+            profile_files = glob.glob(f"{embeddings_dir}/*_profile.pkl")
+            used_ids = set()
+            
+            for profile_file in profile_files:
+                try:
+                    # 파일명에서 SPEAKER_XX 패턴 추출
+                    filename = os.path.basename(profile_file)
+                    if filename.startswith('SPEAKER_') and '_profile.pkl' in filename:
+                        speaker_part = filename.split('_profile.pkl')[0]
+                        used_ids.add(speaker_part)
+                except:
+                    continue
+            
+            # 다음 사용 가능한 ID 찾기
+            counter = 0
+            while True:
+                new_id = f"SPEAKER_{counter:02d}"
+                if new_id not in used_ids:
+                    return new_id
+                counter += 1
+                
+        except Exception as e:
+            print(f"화자 ID 생성 중 오류: {e}")
+            return f"SPEAKER_{int(time.time()) % 1000:03d}"  # 타임스탬프 기반 fallback
+    
+    def extract_and_save_embeddings(self, audio_file, results, target_speakers=None):
+        """
+        화자별 임베딩 벡터를 추출하고 저장하는 함수
+        target_speakers: 저장할 대상 화자 리스트 (None이면 모든 화자)
+        """
+        if target_speakers:
+            # 새로운 화자 ID들을 미리 계산하여 로그에 표시
+            embeddings_dir = "temp/embeddings"
+            os.makedirs(embeddings_dir, exist_ok=True)
+            
+            # 기존 사용된 ID들 확인
+            profile_files = glob.glob(f"{embeddings_dir}/*_profile.pkl")
+            used_ids = set()
+            for profile_file in profile_files:
+                try:
+                    filename = os.path.basename(profile_file)
+                    if filename.startswith('SPEAKER_') and '_profile.pkl' in filename:
+                        speaker_part = filename.split('_profile.pkl')[0]
+                        used_ids.add(speaker_part)
+                except:
+                    continue
+            
+            # 새로운 화자들에게 할당될 ID들 계산
+            new_speaker_ids = []
+            counter = 0
+            for _ in target_speakers:
+                while True:
+                    new_id = f"SPEAKER_{counter:02d}"
+                    if new_id not in used_ids:
+                        new_speaker_ids.append(new_id)
+                        used_ids.add(new_id)  # 중복 방지
+                        break
+                    counter += 1
+                counter += 1
+            
+            print(f"\n=== 새로운 화자 임베딩 추출 및 저장 ({', '.join(new_speaker_ids)}) ===")
+        else:
+            print("\n=== 화자 임베딩 추출 및 저장 ===")
+        
+        # 임베딩 저장 디렉토리 생성
+        embeddings_dir = "temp/embeddings"
+        os.makedirs(embeddings_dir, exist_ok=True)
+        
+        # 화자별 임베딩 저장소
+        speaker_embeddings = defaultdict(list)
+        
+        try:
+            # 오디오 데이터 로드
+            audio_data, sample_rate = librosa.load(audio_file, sr=16000)
+            current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+            
+            print(f"임베딩 추출 시작... (총 {len(results)}개 세그먼트)")
+            
+            for idx, result in enumerate(results):
+                speaker = result["speaker"]
+                start_time = result["start"]
+                end_time = result["end"]
+                
+                # 대상 화자 필터링 (target_speakers가 지정된 경우)
+                if target_speakers and speaker not in target_speakers:
+                    continue
+                
+                # 해당 구간의 오디오 추출
+                start_sample = int(start_time * sample_rate)
+                end_sample = int(end_time * sample_rate)
+                segment_audio = audio_data[start_sample:end_sample]
+                
+                # 너무 짧은 세그먼트는 건너뛰기 (0.5초 미만)
+                if len(segment_audio) < sample_rate * 0.5:
+                    print(f"세그먼트 너무 짧음, 건너뛰기: {speaker} ({start_time:.1f}s-{end_time:.1f}s)")
+                    continue
+                
+                try:
+                    # 임베딩 추출
+                    embedding_vector = self.extract_single_segment_embedding(audio_file, result)
+                    
+                    if embedding_vector is None:
+                        continue
+                    
+                    # 화자별 임베딩 저장
+                    speaker_embeddings[speaker].append({
+                        'embedding': embedding_vector,
+                        'start_time': start_time,
+                        'end_time': end_time,
+                        'duration': end_time - start_time,
+                        'text': result['text'],
+                        'timestamp': current_time
+                    })
+                    
+                    print(f"[{idx+1:2d}/{len(results)}] 임베딩 추출: {speaker} ({start_time:.1f}s-{end_time:.1f}s) - 차원: {embedding_vector.shape}")
+                    
+                except Exception as e:
+                    print(f"임베딩 추출 실패 ({speaker}, {idx}): {e}")
+            
+            # 화자별 임베딩 데이터 저장
+            print(f"\n임베딩 데이터 저장 중...")
+            total_embeddings = 0
+            saved_speaker_mapping = {}  # 원래 ID -> 새 ID 매핑
+            
+            for speaker, embeddings in speaker_embeddings.items():
+                if not embeddings:
+                    continue
+                
+                # 새로운 화자 ID 할당
+                new_speaker_id = self.get_next_speaker_id(embeddings_dir)
+                saved_speaker_mapping[speaker] = new_speaker_id
+                
+                # 개별 임베딩 파일 저장
+                embedding_file = os.path.join(embeddings_dir, f"{new_speaker_id}_embeddings.pkl")
+                with open(embedding_file, 'wb') as f:
+                    pickle.dump(embeddings, f)
+                
+                # 평균 임베딩 계산 (화자 대표 벡터)
+                all_embeddings = np.array([emb['embedding'] for emb in embeddings])
+                mean_embedding = np.mean(all_embeddings, axis=0)
+                std_embedding = np.std(all_embeddings, axis=0)
+                
+                # 화자 프로파일 저장
+                speaker_profile = {
+                    'speaker_id': new_speaker_id,
+                    'original_label': speaker,
+                    'mean_embedding': mean_embedding,
+                    'std_embedding': std_embedding,
+                    'num_segments': len(embeddings),
+                    'total_duration': sum([emb['duration'] for emb in embeddings]),
+                    'timestamp': current_time,
+                    'audio_file': audio_file,
+                    'embedding_dim': mean_embedding.shape[0],
+                    'sample_embeddings': embeddings[:3] if len(embeddings) > 3 else embeddings  # 샘플 저장
+                }
+                
+                profile_file = os.path.join(embeddings_dir, f"{new_speaker_id}_profile.pkl")
+                with open(profile_file, 'wb') as f:
+                    pickle.dump(speaker_profile, f)
+                
+                total_embeddings += len(embeddings)
+                print(f"✅ {new_speaker_id} 프로파일 저장: {profile_file}")
+                print(f"   - 원본 라벨: {speaker}")
+                print(f"   - 세그먼트 수: {len(embeddings)}")
+                print(f"   - 총 발화 시간: {speaker_profile['total_duration']:.2f}초")
+                print(f"   - 임베딩 차원: {mean_embedding.shape[0]}")
+            
+            # 전체 세션 메타데이터 저장
+            session_metadata = {
+                'timestamp': current_time,
+                'audio_file': audio_file,
+                'speakers': list(speaker_embeddings.keys()),
+                'saved_speaker_mapping': saved_speaker_mapping,
+                'total_segments': len(results),
+                'total_embeddings': total_embeddings,
+                'embedding_dim': mean_embedding.shape[0] if speaker_embeddings else 0,
+                'sample_rate': sample_rate
+            }
+            
+            metadata_file = os.path.join(embeddings_dir, f"{current_time}_session_metadata.json")
+            with open(metadata_file, 'w', encoding='utf-8') as f:
+                json.dump(session_metadata, f, ensure_ascii=False, indent=2)
+            
+            print(f"\n🎉 임베딩 데이터 저장 완료!")
+            print(f"📁 저장 위치: {embeddings_dir}/")
+            print(f"📊 총 임베딩 수: {total_embeddings}개")
+            print(f"👥 새로 저장된 화자 수: {len(speaker_embeddings)}명")
+            print(f"🔄 화자 ID 매핑: {saved_speaker_mapping}")
+            
+            return speaker_embeddings, session_metadata, saved_speaker_mapping
+            
+        except Exception as e:
+            print(f"❌ 임베딩 추출 중 오류 발생: {e}")
+            return {}, {}, {}
+    
     def verify_speakers_against_profiles(self, audio_file, results):
-        """기존 화자 프로파일과 비교하여 화자 검증"""
+        """기존 화자 프로파일과 비교하여 화자 검증 및 새로운 화자 저장"""
         try:
             # 기존 프로파일 로드
             existing_profiles = {}
-            # 여러 경로에서 프로파일 파일 검색
-            profile_files = glob.glob("embeddings/*_profile.pkl") + glob.glob("temp/embeddings/*_profile.pkl")
-            print(profile_files)
+            embeddings_dir = "temp/embeddings"
+            os.makedirs(embeddings_dir, exist_ok=True)
+            
+            # 프로파일 파일 검색
+            profile_files = glob.glob(f"{embeddings_dir}/*_profile.pkl")
+            print(f"🔍 기존 프로파일 파일 검색: {len(profile_files)}개 발견")
+            
             for profile_file in profile_files:
                 try:
                     with open(profile_file, 'rb') as f:
                         profile = pickle.load(f)
                         speaker_id = profile['speaker_id']
                         existing_profiles[speaker_id] = profile
+                        print(f"✅ 기존 화자 로드: {speaker_id} ({profile['num_segments']}개 세그먼트)")
                 except Exception as e:
+                    print(f"❌ 프로파일 로드 실패 ({profile_file}): {e}")
                     continue
             
             if not existing_profiles:
-                # 기존 화자가 없으면 모든 화자를 새로운 화자로 처리
+                print("📝 기존 등록된 화자가 없습니다. 모든 화자를 새로 등록합니다.")
+                # 모든 화자에 대해 임베딩 저장
+                speaker_embeddings, session_metadata, saved_speaker_mapping = self.extract_and_save_embeddings(audio_file, results)
+                
+                # 새로운 화자들에 대한 기본 정보 반환
                 verified_speakers = {}
-                for result in results:
-                    speaker = result["speaker"]
-                    if speaker not in verified_speakers:
-                        verified_speakers[speaker] = {
-                            'identified_as': f"새로운_화자_{speaker}",
-                            'confidence': '신규등록',
-                            'similarity': 0.0,
-                            'is_known': False
-                        }
+                for original_speaker, new_speaker_id in saved_speaker_mapping.items():
+                    verified_speakers[original_speaker] = {
+                        'identified_as': f"새로운_화자_{new_speaker_id}",
+                        'confidence': '신규등록',
+                        'similarity': 0.0,
+                        'is_known': False,
+                        'new_speaker_id': new_speaker_id
+                    }
+                
                 return verified_speakers
+            
+            print(f"🔍 총 {len(existing_profiles)}명의 기존 화자와 사전 비교 중...")
             
             # 각 화자별 대표 세그먼트로 검증
             current_speakers = {}
@@ -252,8 +467,11 @@ class AudioProcessingService:
                 current_speakers[speaker].append(result)
             
             verified_speakers = {}
+            speakers_to_save = []  # 새로운 화자들만 저장할 리스트
             
             for current_speaker, speaker_segments in current_speakers.items():
+                print(f"\n🎯 {current_speaker} 사전 검증 중...")
+                
                 # 가장 긴 세그먼트 선택
                 longest_segment = max(speaker_segments, key=lambda x: x['end'] - x['start'])
                 
@@ -261,6 +479,8 @@ class AudioProcessingService:
                 representative_embedding = self.extract_single_segment_embedding(audio_file, longest_segment)
                 
                 if representative_embedding is None:
+                    print(f"   ❌ 대표 임베딩 추출 실패")
+                    speakers_to_save.append(current_speaker)
                     verified_speakers[current_speaker] = {
                         'identified_as': f"새로운_화자_{current_speaker}",
                         'confidence': '임베딩추출실패',
@@ -272,6 +492,7 @@ class AudioProcessingService:
                 # 기존 화자들과 비교
                 best_match = None
                 best_similarity = 0
+                all_similarities = {}
                 
                 for existing_speaker, profile in existing_profiles.items():
                     existing_mean = profile['mean_embedding']
@@ -282,58 +503,212 @@ class AudioProcessingService:
                         existing_mean.reshape(1, -1)
                     )[0][0]
                     
+                    all_similarities[existing_speaker] = similarity
+                    
                     if similarity > best_similarity:
                         best_similarity = similarity
                         best_match = existing_speaker
                 
-                # 임계값 기준으로 판단
+                # 임계값 기준으로 판단 (0.6 사용)
                 threshold = 0.6
                 
                 if best_similarity >= threshold:
-                    # 기존 화자로 인식된 경우
+                    # 기존 화자로 인식된 경우 - 실제 이름 가져오기
                     from app.services.speaker_service import SpeakerService
                     speaker_service = SpeakerService()
-                    identified_as = speaker_service.get_display_name(best_match)
+                    display_name = speaker_service.get_display_name(best_match)
+                    identified_as = display_name
                     confidence_level = "높음" if best_similarity >= 0.8 else "보통"
                     is_known = True
                     matched_speaker_id = best_match
+                    print(f"   ✅ 기존 화자 매칭: {best_match} -> {display_name} (유사도: {best_similarity:.4f}, 신뢰도: {confidence_level})")
+                    print(f"   💾 임베딩 저장 생략 - 기존 프로필 재사용")
                 else:
                     identified_as = f"새로운_화자_{current_speaker}"
                     confidence_level = "새로운화자"
                     is_known = False
                     matched_speaker_id = None
+                    speakers_to_save.append(current_speaker)
+                    print(f"   ❓ 새로운 화자: {identified_as} (최고 유사도: {best_similarity:.4f})")
+                    print(f"   💾 임베딩 저장 예정")
+                
+                # 상위 3개 유사도 출력
+                sorted_similarities = sorted(all_similarities.items(), key=lambda x: x[1], reverse=True)
+                print(f"   📊 유사도 순위:")
+                for i, (speaker, sim) in enumerate(sorted_similarities[:3], 1):
+                    status = "✅" if sim >= threshold else "❌"
+                    print(f"      {status} {i}위: {speaker} ({sim:.4f})")
                 
                 verified_speakers[current_speaker] = {
                     'identified_as': identified_as,
                     'confidence': confidence_level,
                     'similarity': best_similarity,
                     'is_known': is_known,
-                    'matched_speaker_id': matched_speaker_id
+                    'matched_speaker_id': matched_speaker_id,
+                    'all_similarities': all_similarities
                 }
+            
+            print(f"\n🎉 사전 검증 완료!")
+            print(f"📊 검증 결과 요약:")
+            total_speakers = len(verified_speakers)
+            known_count = sum(1 for v in verified_speakers.values() if v['is_known'])
+            new_count = len(verified_speakers) - known_count
+            print(f"   - 전체 화자: {total_speakers}명")
+            print(f"   - 기존 화자: {known_count}명 (임베딩 저장 생략)")
+            print(f"   - 새로운 화자: {new_count}명 (임베딩 저장 진행)")
+            
+            # 새로운 화자들에 대해서만 전체 임베딩 저장
+            if speakers_to_save:
+                print(f"\n💾 새로운 화자들에 대한 임베딩 저장 시작...")
+                
+                # 새로운 화자들의 결과만 필터링
+                new_speaker_results = [r for r in results if r['speaker'] in speakers_to_save]
+                
+                # 임베딩 추출 및 저장 (새로운 화자들만)
+                new_speaker_embeddings, session_metadata, saved_speaker_mapping = self.extract_and_save_embeddings(
+                    audio_file, new_speaker_results, speakers_to_save
+                )
+                
+                # 새로 저장된 화자들의 정보 업데이트
+                for original_speaker, new_speaker_id in saved_speaker_mapping.items():
+                    if original_speaker in verified_speakers:
+                        verified_speakers[original_speaker]['identified_as'] = f"새로운_화자_{new_speaker_id}"
+                        verified_speakers[original_speaker]['new_speaker_id'] = new_speaker_id
             
             return verified_speakers
             
         except Exception as e:
-            print(f"화자 검증 중 오류: {e}")
+            print(f"❌ 화자 검증 중 오류 발생: {e}")
             return {}
     
     def generate_speaker_summary(self, results):
         """화자별 발화 요약 생성"""
         speaker_summary = {}
         for result in results:
-            verified_speaker = result.get("verified_speaker", result["speaker"])
-            if verified_speaker not in speaker_summary:
-                speaker_summary[verified_speaker] = {
+            # 화자 키 결정 (기존 화자면 실제 이름, 새로운 화자면 speaker_id 사용)
+            if result.get('is_known_speaker'):
+                # 기존 화자인 경우 실제 이름 사용
+                speaker_key = result.get("verified_speaker") or result.get("speaker_id", "UNKNOWN")
+            else:
+                # 새로운 화자인 경우 speaker_id 사용
+                speaker_key = result.get("speaker_id") or result.get("verified_speaker") or result.get("speaker", "UNKNOWN")
+            
+            if speaker_key not in speaker_summary:
+                speaker_summary[speaker_key] = {
                     "total_duration": 0,
                     "segment_count": 0,
                     "texts": []
                 }
             
-            speaker_summary[verified_speaker]["total_duration"] += float(result["duration"])
-            speaker_summary[verified_speaker]["segment_count"] += 1
-            speaker_summary[verified_speaker]["texts"].append(result["text"])
+            speaker_summary[speaker_key]["total_duration"] += float(result["duration"])
+            speaker_summary[speaker_key]["segment_count"] += 1
+            speaker_summary[speaker_key]["texts"].append(result["text"])
         
         return speaker_summary
+    
+    # 결과값 확인용 / 실제 서비스 시에는 필요하지 않은 기능
+    def save_transcript_to_file(self, results, speaker_summary, verified_speakers, processing_info):
+        """STT 결과를 가독성 좋은 대화록 파일로 저장"""
+        try:
+            # 결과 디렉토리 생성
+            result_dir = "temp/result"
+            os.makedirs(result_dir, exist_ok=True)
+            
+            # 파일명 생성 (타임스탬프 포함)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            transcript_filename = f"transcript_{timestamp}.txt"
+            transcript_path = os.path.join(result_dir, transcript_filename)
+            
+            with open(transcript_path, 'w', encoding='utf-8') as f:
+                # 헤더 정보 작성
+                f.write("=" * 80 + "\n")
+                f.write("                          음성 인식 대화록\n")
+                f.write("=" * 80 + "\n")
+                f.write(f"생성 일시: {datetime.now().strftime('%Y년 %m월 %d일 %H시 %M분 %S초')}\n")
+                f.write(f"총 처리 시간: {processing_info.get('total_time', 0):.2f}초\n")
+                f.write(f"총 세그먼트 수: {processing_info.get('total_segments', 0)}개\n")
+                f.write(f"인식된 화자 수: {processing_info.get('unique_speakers', 0)}명\n")
+                f.write("\n")
+                
+                # 화자 정보 요약
+                f.write("-" * 50 + "\n")
+                f.write("화자 정보 요약\n")
+                f.write("-" * 50 + "\n")
+                for speaker, info in speaker_summary.items():
+                    f.write(f"• {speaker}\n")
+                    f.write(f"  - 총 발화 시간: {info['total_duration']:.1f}초\n")
+                    f.write(f"  - 발화 횟수: {info['segment_count']}회\n")
+                    
+                    # 검증 정보 추가
+                    original_speaker = None
+                    for orig, verified_info in verified_speakers.items():
+                        if verified_info['identified_as'] == speaker:
+                            original_speaker = orig
+                            break
+                    
+                    if original_speaker and verified_speakers.get(original_speaker):
+                        verify_info = verified_speakers[original_speaker]
+                        f.write(f"  - 화자 인식: {verify_info['confidence']}")
+                        if verify_info['is_known']:
+                            f.write(f" (유사도: {verify_info['similarity']:.2f})")
+                        elif verify_info.get('new_speaker_id'):
+                            f.write(f" (새 ID: {verify_info['new_speaker_id']})")
+                        f.write("\n")
+                    f.write("\n")
+                
+                # 대화록 본문
+                f.write("=" * 80 + "\n")
+                f.write("                            대화록 본문\n")
+                f.write("=" * 80 + "\n\n")
+                
+                # 시간순으로 정렬된 세그먼트들을 대화록 형태로 작성
+                sorted_results = sorted(results, key=lambda x: x['start'])
+                
+                for i, result in enumerate(sorted_results, 1):
+                    # 시간 정보를 분:초 형태로 변환
+                    start_min = int(result['start'] // 60)
+                    start_sec = int(result['start'] % 60)
+                    end_min = int(result['end'] // 60)
+                    end_sec = int(result['end'] % 60)
+                    
+                    # 화자명 결정 (기존 화자면 실제 이름, 새로운 화자면 speaker_id 사용)
+                    if result.get('is_known_speaker'):
+                        # 기존 화자인 경우 실제 이름 사용
+                        speaker_name = result.get('verified_speaker', result.get('speaker_id', 'UNKNOWN'))
+                    else:
+                        # 새로운 화자인 경우 speaker_id 사용
+                        speaker_name = result.get('speaker_id') or result.get('verified_speaker', result.get('speaker', 'UNKNOWN'))
+                    
+                    # 대화록 형태로 작성
+                    f.write(f"[{start_min:02d}:{start_sec:02d} - {end_min:02d}:{end_sec:02d}] {speaker_name}\n")
+                    f.write(f"{result['text']}\n")
+                    
+                    # 화자 검증 정보 (상세 모드)
+                    if result.get('is_known_speaker') is not None:
+                        confidence = result.get('verification_confidence', 'N/A')
+                        similarity = result.get('similarity_score', 0)
+                        original_label = result.get('original_speaker_label', '')
+                        
+                        f.write(f"(검증: {confidence}")
+                        if similarity > 0:
+                            f.write(f", 유사도: {similarity:.2f}")
+                        if original_label:
+                            f.write(f", 원본: {original_label}")
+                        f.write(")\n")
+                    
+                    f.write("\n")
+                
+                # 푸터
+                f.write("=" * 80 + "\n")
+                f.write("                          대화록 종료\n")
+                f.write("=" * 80 + "\n")
+            
+            print(f"대화록 파일 저장 완료: {transcript_path}")
+            return transcript_path
+            
+        except Exception as e:
+            print(f"대화록 파일 저장 중 오류: {e}")
+            return None
     
     def cleanup_files(self, original_file_path, converted_file_path):
         """업로드된 임시 파일들 정리"""
