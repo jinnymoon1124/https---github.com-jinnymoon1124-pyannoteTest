@@ -1,7 +1,5 @@
-/audio/*
-/temp/*
-/embeddings/*
+audio/
+temp/
 __pycache__/
-uploads/
 *.wav
 *.mp3

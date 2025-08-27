@@ -18,7 +18,7 @@ from datetime import datetime
 class VoiceDataChecker:
     """음성 데이터 확인 클래스"""
     
-    def __init__(self, embeddings_dir="embeddings"):
+    def __init__(self, embeddings_dir="temp/embeddings"):
         self.embeddings_dir = embeddings_dir
         
     def check_all_data(self):
