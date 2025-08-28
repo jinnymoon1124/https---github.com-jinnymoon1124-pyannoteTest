@@ -7,11 +7,12 @@ import time
 from datetime import datetime
 from flask import Blueprint, request, jsonify
 from flask_cors import CORS
-from typing import Dict, Any
 
 from app.controllers.base_controller import BaseController
 from app.services.audio_service import AudioProcessingService
-from app.utils.file_utils import allowed_file, get_safe_filename
+from app.services.s3_service import S3Service
+from app.services.speaker_service import SpeakerService
+from app.utils.file_utils import get_safe_filename
 from app.utils.data_utils import convert_numpy_types
 
 # Blueprint 정의
@@ -26,14 +27,13 @@ class AudioController(BaseController):
         """컨트롤러 초기화"""
         super().__init__()
         self.audio_service = AudioProcessingService()
+        self.s3_service = S3Service()
+        self.speaker_service = SpeakerService()
         self.upload_folder = 'temp/uploads'
     
     def process_audio(self):
         """오디오 파일을 받아서 화자 분리 및 STT 처리"""
-        # 파일 검증
-        validation_result = self._validate_uploaded_file()
-        if validation_result:
-            return validation_result
+
         # 모델 초기화 (처음 호출 시에만)
         self.audio_service.initialize_models()
         
@@ -41,6 +41,9 @@ class AudioController(BaseController):
         
         # 파일 저장 및 변환
         original_file_path, converted_file_path = self._save_and_convert_file(file)
+        
+        # 원본 파일을 S3에 업로드
+        self._upload_original_file_to_s3(original_file_path, file.filename)
         
         try:
             # 화자 분리 처리
@@ -57,7 +60,10 @@ class AudioController(BaseController):
             verified_speakers = self.audio_service.verify_speakers_against_profiles(converted_file_path, results)
             verify_time = time.time() - verify_start_time
             
-            # 검증 결과로 화자명 업데이트
+            # 검증된 화자들을 DynamoDB에 저장
+            self._save_verified_speakers_to_dynamodb(verified_speakers)
+            
+            # 검증 결과로 화자명 업데이트 (DynamoDB에서 이름 조회)
             self._update_results_with_verification(results, verified_speakers)
             
             # 화자별 발화 요약 생성
@@ -90,32 +96,6 @@ class AudioController(BaseController):
             # 파일 정리
             self.audio_service.cleanup_files(original_file_path, converted_file_path)
     
-    def _validate_uploaded_file(self):
-        """업로드된 파일 검증"""
-        print("업로드된 파일 검증 시작...")
-        print(f"Request files: {list(request.files.keys())}")  # 업로드된 파일 키 확인
-        
-        if 'audio_file' not in request.files:
-            print("오류: audio_file 키가 request.files에 없음")
-            return jsonify({'error': '오디오 파일이 없습니다.'}), 400
-        
-        file = request.files['audio_file']
-        print(f"파일명: {file.filename}")
-        print(f"파일 크기: {file.content_length if hasattr(file, 'content_length') else 'Unknown'}")
-        
-        if file.filename == '':
-            print("오류: 빈 파일명")
-            return jsonify({'error': '파일이 선택되지 않았습니다.'}), 400
-        
-        if not allowed_file(file.filename):
-            from app.utils.file_utils import ALLOWED_EXTENSIONS
-            print(f"오류: 지원되지 않는 파일 형식 - {file.filename}")
-            return jsonify({
-                'error': f'지원되지 않는 파일 형식입니다. 지원 형식: {", ".join(ALLOWED_EXTENSIONS)}'
-            }), 400
-        
-        print("파일 검증 통과!")
-        return None  # 검증 통과
     
     def _save_and_convert_file(self, file):
         """파일 저장 및 WAV 변환"""
@@ -135,32 +115,106 @@ class AudioController(BaseController):
         
         return original_file_path, converted_file_path
     
+    def _upload_original_file_to_s3(self, file_path, original_filename):
+        """원본 오디오 파일을 S3에 업로드"""
+        try:
+            now = datetime.now()
+            
+            # 파일 확장자 추출
+            file_ext = os.path.splitext(original_filename)[1].lower()
+            filename_without_ext = os.path.splitext(original_filename)[0]
+            
+            # 임의값 생성 (8자리)
+            import uuid
+            random_value = str(uuid.uuid4())[:8]
+            
+            # 파일명 생성: yyyymmdd_원본파일명_임의값.확장자
+            new_filename = f"{now.strftime('%Y%m%d')}_{filename_without_ext}_{random_value}{file_ext}"
+            
+            # S3 키 생성: audio/yyyy/mm/파일명
+            s3_key = f"audio/{now.strftime('%Y')}/{now.strftime('%m')}/{new_filename}"
+            
+            print(f"📤 원본 오디오 파일 S3 업로드: {s3_key}")
+            
+            # S3에 업로드
+            result = self.s3_service.upload_file(
+                file_path=file_path,
+                object_key=s3_key,
+                file_type="audio"
+            )
+            
+            if result['success']:
+                print(f"✅ 원본 파일 S3 업로드 완료: {s3_key}")
+                return s3_key
+            else:
+                print(f"❌ 원본 파일 S3 업로드 실패: {result.get('error', 'Unknown error')}")
+                return None
+                
+        except Exception as e:
+            print(f"❌ 원본 파일 S3 업로드 중 오류: {e}")
+            return None
+    
+    def _save_verified_speakers_to_dynamodb(self, verified_speakers):
+        """검증된 화자들을 DynamoDB에 저장"""
+        try:
+            for speaker_id, speaker_info in verified_speakers.items():
+                # 새로운 화자이거나 기존 화자로 매칭된 경우 DynamoDB에 저장
+                if speaker_info.get('new_speaker_id') or speaker_info.get('matched_speaker_id'):
+                    # 화자 ID 결정
+                    final_speaker_id = speaker_info.get('matched_speaker_id') or speaker_info.get('new_speaker_id') or speaker_id
+                    
+                    # DynamoDB에 저장 (기본 이름은 speaker_id) - SpeakerService를 통해 저장
+                    result = self.speaker_service.create_or_update_speaker_name(final_speaker_id, final_speaker_id)
+                    
+                    if result['success']:
+                        print(f"✅ 화자 {final_speaker_id} DynamoDB 저장 완료: {result['action']}")
+                    else:
+                        print(f"❌ 화자 {final_speaker_id} DynamoDB 저장 실패: {result.get('error')}")
+                        
+        except Exception as e:
+            print(f"❌ 검증된 화자 DynamoDB 저장 중 오류: {e}")
+    
     def _update_results_with_verification(self, results, verified_speakers):
-        """검증 결과로 화자명 업데이트"""
+        """검증 결과로 화자명 업데이트 (DynamoDB에서 실제 이름 조회)"""
         for result in results:
             original_speaker = result["speaker"]
             if original_speaker in verified_speakers:
                 verified_info = verified_speakers[original_speaker]
-                result["verified_speaker"] = verified_info['identified_as']
+                
+                # 화자 ID 정보 정리
+                if verified_info.get('new_speaker_id'):
+                    # 새로운 화자인 경우
+                    final_speaker_id = verified_info['new_speaker_id']
+                elif verified_info.get('matched_speaker_id'):
+                    # 기존 화자로 매칭된 경우
+                    final_speaker_id = verified_info['matched_speaker_id']
+                else:
+                    # fallback: 원본 화자 라벨 사용
+                    final_speaker_id = original_speaker
+                
+                # DynamoDB에서 화자의 실제 이름 조회
+                display_name = self.speaker_service.get_display_name(final_speaker_id)
+                
+                # 검증 정보와 함께 화자 이름 설정
+                result["verified_speaker"] = display_name  # DynamoDB에서 조회한 실제 이름
+                result["speaker_id"] = final_speaker_id
                 result["verification_confidence"] = verified_info['confidence']
                 result["similarity_score"] = float(verified_info['similarity'])
                 result["is_known_speaker"] = verified_info['is_known']
-                
-                # 화자 ID 정보 정리 (화자 이름 변경 시 사용할 ID)
-                if verified_info.get('new_speaker_id'):
-                    # 새로운 화자인 경우
-                    result["speaker_id"] = verified_info['new_speaker_id']
-                elif verified_info.get('matched_speaker_id'):
-                    # 기존 화자로 매칭된 경우
-                    result["speaker_id"] = verified_info['matched_speaker_id']
-                else:
-                    # fallback: 원본 화자 라벨 사용
-                    result["speaker_id"] = original_speaker
                 
                 # 원본 화자 라벨은 별도 필드로 보관 (디버깅용)
                 result["original_speaker_label"] = original_speaker
                 
                 # 기존 speaker 필드 제거 (혼동 방지)
+                del result["speaker"]
+            else:
+                # 검증되지 않은 화자의 경우 기본 처리
+                result["verified_speaker"] = original_speaker
+                result["speaker_id"] = original_speaker
+                result["verification_confidence"] = 0.0
+                result["similarity_score"] = 0.0
+                result["is_known_speaker"] = False
+                result["original_speaker_label"] = original_speaker
                 del result["speaker"]
     
     def _build_response_data(self, results, speaker_summary, verified_speakers,

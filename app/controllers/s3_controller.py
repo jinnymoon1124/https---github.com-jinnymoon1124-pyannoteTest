@@ -357,7 +357,6 @@ def health_check():
         health_info = {
             'service': 'S3 File Upload Service',
             'environment': s3_service.config.ENVIRONMENT,
-            'status': s3_status,
             'message': s3_message,
             'bucket': s3_service.config.S3_BUCKET,
             'region': s3_service.config.AWS_REGION,

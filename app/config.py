@@ -24,4 +24,5 @@ class ConstantConfig:
         """AWS 일반 설정 초기화"""
         self.S3_BUCKET = os.getenv("AWS_S3_VOICE_BUCKET")
         self.AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-2")
+        self.DYNAMODB_SPEAKER_TABLE = os.getenv("AWS_DYNAMODB_SPEAKER_TABLE", "speakers")
         

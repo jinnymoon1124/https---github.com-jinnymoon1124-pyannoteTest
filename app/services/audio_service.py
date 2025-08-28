@@ -18,6 +18,10 @@ from sklearn.metrics.pairwise import cosine_similarity
 from pyannote.audio import Pipeline
 import glob
 
+from app.services.s3_service import S3Service
+from app.services.speaker_service import SpeakerService
+from app.models.speaker_model import SpeakerModel
+
 
 class AudioProcessingService:
     """오디오 처리 서비스 클래스"""
@@ -27,6 +31,8 @@ class AudioProcessingService:
         self.pipeline = None
         self.whisper_model = None
         self.device = None
+        self.s3_service = S3Service()
+        self.speaker_service = SpeakerService()
         
     def initialize_models(self):
         """AI 모델들을 초기화하는 함수"""
@@ -348,11 +354,11 @@ class AudioProcessingService:
                 if not embeddings:
                     continue
                 
-                # 새로운 화자 ID 할당
-                new_speaker_id = self.get_next_speaker_id(embeddings_dir)
+                # 새로운 화자 ID 할당 (DynamoDB 기반)
+                new_speaker_id = self.speaker_service.get_next_available_speaker_id()
                 saved_speaker_mapping[speaker] = new_speaker_id
                 
-                # 개별 임베딩 파일 저장
+                # 개별 임베딩 파일 저장 (로컬)
                 embedding_file = os.path.join(embeddings_dir, f"{new_speaker_id}_embeddings.pkl")
                 with open(embedding_file, 'wb') as f:
                     pickle.dump(embeddings, f)
@@ -362,7 +368,7 @@ class AudioProcessingService:
                 mean_embedding = np.mean(all_embeddings, axis=0)
                 std_embedding = np.std(all_embeddings, axis=0)
                 
-                # 화자 프로파일 저장
+                # 화자 프로파일 저장 (로컬)
                 speaker_profile = {
                     'speaker_id': new_speaker_id,
                     'original_label': speaker,
@@ -379,6 +385,16 @@ class AudioProcessingService:
                 profile_file = os.path.join(embeddings_dir, f"{new_speaker_id}_profile.pkl")
                 with open(profile_file, 'wb') as f:
                     pickle.dump(speaker_profile, f)
+                
+                # S3에 화자별 폴더로 업로드
+                self._upload_speaker_files_to_s3(new_speaker_id, embedding_file, profile_file)
+                
+                # DynamoDB에 화자 정보 저장 (기본 이름은 speaker_id)
+                result = self.speaker_service.create_or_update_speaker_name(new_speaker_id, new_speaker_id)
+                if not result['success']:
+                    print(f"❌ 화자 {new_speaker_id} DynamoDB 저장 실패: {result['error']}")
+                else:
+                    print(f"✅ 화자 {new_speaker_id} DynamoDB 저장 완료: {result['action']}")
                 
                 total_embeddings += len(embeddings)
                 print(f"✅ {new_speaker_id} 프로파일 저장: {profile_file}")
@@ -415,28 +431,131 @@ class AudioProcessingService:
             print(f"❌ 임베딩 추출 중 오류 발생: {e}")
             return {}, {}, {}
     
+    def _upload_speaker_files_to_s3(self, speaker_id, embedding_file_path, profile_file_path):
+        """화자별 임베딩 및 프로파일 파일을 S3에 업로드"""
+        try:
+            print(f"📤 S3 업로드 시작: {speaker_id}")
+            
+            # S3 경로 구조: speakers/{speaker_id}/embeddings.pkl, speakers/{speaker_id}/profile.pkl
+            embedding_s3_key = f"speakers/{speaker_id}/embeddings.pkl"
+            profile_s3_key = f"speakers/{speaker_id}/profile.pkl"
+            
+            # 임베딩 파일 업로드
+            embedding_result = self.s3_service.upload_file(
+                file_path=embedding_file_path,
+                object_key=embedding_s3_key,
+                file_type="speaker_data"
+            )
+            
+            if embedding_result['success']:
+                print(f"   ✅ 임베딩 파일 S3 업로드 완료: {embedding_s3_key}")
+            else:
+                print(f"   ❌ 임베딩 파일 S3 업로드 실패: {embedding_result.get('error', 'Unknown error')}")
+            
+            # 프로파일 파일 업로드
+            profile_result = self.s3_service.upload_file(
+                file_path=profile_file_path,
+                object_key=profile_s3_key,
+                file_type="speaker_data"
+            )
+            
+            if profile_result['success']:
+                print(f"   ✅ 프로파일 파일 S3 업로드 완료: {profile_s3_key}")
+            else:
+                print(f"   ❌ 프로파일 파일 S3 업로드 실패: {profile_result.get('error', 'Unknown error')}")
+            
+            # 업로드 성공 여부 반환
+            return embedding_result['success'] and profile_result['success']
+            
+        except Exception as e:
+            print(f"❌ S3 업로드 중 오류 발생 ({speaker_id}): {e}")
+            return False
+    
+    def _load_speaker_profiles_from_s3(self):
+        """S3에서 모든 화자 프로파일을 로드"""
+        try:
+            print("🔍 S3에서 화자 프로파일 로드 중...")
+            
+            # S3에서 speakers/ 경로의 파일 목록 조회
+            files_result = self.s3_service.list_files(prefix="speakers/")
+            
+            if not files_result['success']:
+                print(f"❌ S3 파일 목록 조회 실패: {files_result.get('error', 'Unknown error')}")
+                return {}
+            
+            # profile.pkl 파일들만 필터링
+            profile_files = [f for f in files_result['files'] if f['key'].endswith('/profile.pkl')]
+            print(f"📁 S3에서 {len(profile_files)}개의 프로파일 파일 발견")
+            
+            existing_profiles = {}
+            temp_dir = "temp/s3_cache"
+            os.makedirs(temp_dir, exist_ok=True)
+            
+            for file_info in profile_files:
+                try:
+                    s3_key = file_info['key']
+                    # speakers/SPEAKER_XX/profile.pkl에서 SPEAKER_XX 추출
+                    speaker_id = s3_key.split('/')[1]
+                    
+                    # 임시 파일로 다운로드
+                    local_temp_path = os.path.join(temp_dir, f"{speaker_id}_profile.pkl")
+                    download_result = self.s3_service.download_file(s3_key, local_temp_path)
+                    
+                    if download_result['success']:
+                        # 프로파일 로드
+                        with open(local_temp_path, 'rb') as f:
+                            profile = pickle.load(f)
+                            existing_profiles[speaker_id] = profile
+                            print(f"✅ S3에서 화자 프로파일 로드: {speaker_id} ({profile['num_segments']}개 세그먼트)")
+                        
+                        # 임시 파일 삭제
+                        os.remove(local_temp_path)
+                    else:
+                        print(f"❌ 프로파일 다운로드 실패 ({s3_key}): {download_result.get('error', 'Unknown error')}")
+                        
+                except Exception as e:
+                    print(f"❌ 프로파일 처리 실패 ({s3_key}): {e}")
+                    continue
+            
+            # 임시 디렉토리 정리
+            try:
+                os.rmdir(temp_dir)
+            except:
+                pass
+            
+            print(f"🎉 S3에서 총 {len(existing_profiles)}명의 화자 프로파일 로드 완료")
+            return existing_profiles
+            
+        except Exception as e:
+            print(f"❌ S3 프로파일 로드 중 오류 발생: {e}")
+            return {}
+    
     def verify_speakers_against_profiles(self, audio_file, results):
         """기존 화자 프로파일과 비교하여 화자 검증 및 새로운 화자 저장"""
         try:
-            # 기존 프로파일 로드
-            existing_profiles = {}
-            embeddings_dir = "temp/embeddings"
-            os.makedirs(embeddings_dir, exist_ok=True)
+            # S3에서 기존 프로파일 로드
+            existing_profiles = self._load_speaker_profiles_from_s3()
             
-            # 프로파일 파일 검색
-            profile_files = glob.glob(f"{embeddings_dir}/*_profile.pkl")
-            print(f"🔍 기존 프로파일 파일 검색: {len(profile_files)}개 발견")
-            
-            for profile_file in profile_files:
-                try:
-                    with open(profile_file, 'rb') as f:
-                        profile = pickle.load(f)
-                        speaker_id = profile['speaker_id']
-                        existing_profiles[speaker_id] = profile
-                        print(f"✅ 기존 화자 로드: {speaker_id} ({profile['num_segments']}개 세그먼트)")
-                except Exception as e:
-                    print(f"❌ 프로파일 로드 실패 ({profile_file}): {e}")
-                    continue
+            # S3에서 로드된 프로파일이 없으면 로컬에서도 확인 (fallback)
+            if not existing_profiles:
+                print("📂 S3에서 프로파일을 찾을 수 없어 로컬 fallback 시도...")
+                embeddings_dir = "temp/embeddings"
+                os.makedirs(embeddings_dir, exist_ok=True)
+                
+                # 프로파일 파일 검색
+                profile_files = glob.glob(f"{embeddings_dir}/*_profile.pkl")
+                print(f"🔍 로컬 프로파일 파일 검색: {len(profile_files)}개 발견")
+                
+                for profile_file in profile_files:
+                    try:
+                        with open(profile_file, 'rb') as f:
+                            profile = pickle.load(f)
+                            speaker_id = profile['speaker_id']
+                            existing_profiles[speaker_id] = profile
+                            print(f"✅ 로컬 화자 로드: {speaker_id} ({profile['num_segments']}개 세그먼트)")
+                    except Exception as e:
+                        print(f"❌ 로컬 프로파일 로드 실패 ({profile_file}): {e}")
+                        continue
             
             if not existing_profiles:
                 print("📝 기존 등록된 화자가 없습니다. 모든 화자를 새로 등록합니다.")
@@ -513,10 +632,8 @@ class AudioProcessingService:
                 threshold = 0.6
                 
                 if best_similarity >= threshold:
-                    # 기존 화자로 인식된 경우 - 실제 이름 가져오기
-                    from app.services.speaker_service import SpeakerService
-                    speaker_service = SpeakerService()
-                    display_name = speaker_service.get_display_name(best_match)
+                    # 기존 화자로 인식된 경우 - DynamoDB에서 실제 이름 가져오기
+                    display_name = self.speaker_service.get_display_name(best_match)
                     identified_as = display_name
                     confidence_level = "높음" if best_similarity >= 0.8 else "보통"
                     is_known = True
@@ -704,10 +821,46 @@ class AudioProcessingService:
                 f.write("=" * 80 + "\n")
             
             print(f"대화록 파일 저장 완료: {transcript_path}")
+            
+            # S3에 대화록 파일 업로드 (오디오 파일과 동일한 경로 구조)
+            s3_transcript_path = self._upload_transcript_to_s3(transcript_path, timestamp)
+            
             return transcript_path
             
         except Exception as e:
             print(f"대화록 파일 저장 중 오류: {e}")
+            return None
+    
+    def _upload_transcript_to_s3(self, transcript_path, timestamp):
+        """대화록 파일을 S3에 업로드 (오디오 파일과 동일한 경로 구조)"""
+        try:
+            from datetime import datetime
+            now = datetime.now()
+            
+            # 파일명 생성: transcript_yyyymmdd_HHMMSS.txt
+            transcript_filename = f"transcript_{timestamp}.txt"
+            
+            # S3 키 생성: audio/yyyy/mm/transcript_파일명 (오디오와 동일한 경로)
+            s3_key = f"audio/{now.strftime('%Y')}/{now.strftime('%m')}/{transcript_filename}"
+            
+            print(f"📤 대화록 파일 S3 업로드: {s3_key}")
+            
+            # S3에 업로드
+            result = self.s3_service.upload_file(
+                file_path=transcript_path,
+                object_key=s3_key,
+                file_type="transcript"
+            )
+            
+            if result['success']:
+                print(f"✅ 대화록 파일 S3 업로드 완료: {s3_key}")
+                return s3_key
+            else:
+                print(f"❌ 대화록 파일 S3 업로드 실패: {result.get('error', 'Unknown error')}")
+                return None
+                
+        except Exception as e:
+            print(f"❌ 대화록 파일 S3 업로드 중 오류: {e}")
             return None
     
     def cleanup_files(self, original_file_path, converted_file_path):
