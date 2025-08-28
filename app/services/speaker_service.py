@@ -9,7 +9,7 @@ import glob
 from typing import Dict, Any
 from datetime import datetime
 
-from app.models.speaker_model import SpeakerModel
+from app.model.speaker_model import SpeakerModel
 from pynamodb.exceptions import DoesNotExist
 
 

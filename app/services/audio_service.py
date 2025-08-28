@@ -17,10 +17,26 @@ from collections import defaultdict
 from sklearn.metrics.pairwise import cosine_similarity
 from pyannote.audio import Pipeline
 import glob
+import warnings
+
+# TorchAudio deprecation 경고 억제 (pyannote.audio 내부에서 발생)
+warnings.filterwarnings("ignore", message=".*torchaudio.*deprecated.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*AudioMetaData.*deprecated.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*load_with_torchcodec.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*list_audio_backends.*deprecated.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*TorchCodec.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*speechbrain.*deprecated.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*PySoundFile failed.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*audioread.*deprecated.*", category=FutureWarning)
+warnings.filterwarnings("ignore", message=".*TensorFloat-32.*", category=UserWarning)
+
+# 전체적으로 torchaudio 관련 경고 모두 억제
+import os
+os.environ['PYTHONWARNINGS'] = 'ignore::UserWarning:torchaudio'
 
 from app.services.s3_service import S3Service
 from app.services.speaker_service import SpeakerService
-from app.models.speaker_model import SpeakerModel
+from app.model.speaker_model import SpeakerModel
 
 
 class AudioProcessingService:
@@ -54,6 +70,7 @@ class AudioProcessingService:
             
             # Whisper 모델 로드
             self.whisper_model = whisper.load_model("large-v3")
+            # self.whisper_model = whisper.load_model('small')
             self.whisper_model = self.whisper_model.to(self.device)
             print("Whisper STT 모델 로드 완료")
     
@@ -83,7 +100,7 @@ class AudioProcessingService:
     
     def perform_speaker_diarization(self, file_path):
         """화자 분리 처리를 수행"""
-        print("화자 분리 처리 시작...")
+        print("🎭 화자 분리 처리 시작...")
         start_time = time.time()
         
         try:
@@ -122,6 +139,7 @@ class AudioProcessingService:
                 raise Exception(f"화자 분리 처리 실패: {str(e)} / 재시도 실패: {str(e2)}")
         
         diarization_time = time.time() - start_time
+        print(f"🎭 화자 분리 완료 (소요시간: {diarization_time:.2f}초)")
         return diarization, diarization_time
     
     def perform_speech_to_text(self, file_path, diarization):
@@ -145,7 +163,14 @@ class AudioProcessingService:
                 
                 # Whisper를 사용하여 STT 수행
                 try:
-                    result = self.whisper_model.transcribe(temp_file.name, language="ko")
+                    result = self.whisper_model.transcribe(
+                        temp_file.name, 
+                        language="ko",
+                        condition_on_previous_text=False,  # 환각 방지
+                        no_speech_threshold=0.6,
+                        compression_ratio_threshold=2.4,
+                        temperature=0
+                    )
                     text = result["text"].strip()
                     
                     results.append({
@@ -172,14 +197,15 @@ class AudioProcessingService:
         stt_time = time.time() - stt_start_time
         return results, stt_time
     
-    def extract_single_segment_embedding(self, audio_file, segment_result):
-        """단일 세그먼트에 대한 임베딩 추출 (빠른 검증용)"""
+    def extract_single_segment_embedding(self, audio_file, segment_result, audio_data=None, sample_rate=None):
+        """단일 세그먼트에 대한 임베딩 추출 (최적화된 버전)"""
         try:
             # 임베딩 모델 추출
             embedding_model = self.pipeline._embedding
             
-            # 오디오 데이터 로드
-            audio_data, sample_rate = librosa.load(audio_file, sr=16000)
+            # 오디오 데이터 재사용 (이미 로드된 경우)
+            if audio_data is None or sample_rate is None:
+                audio_data, sample_rate = librosa.load(audio_file, sr=16000)
             
             start_time = segment_result["start"]
             end_time = segment_result["end"]
@@ -358,17 +384,12 @@ class AudioProcessingService:
                 new_speaker_id = self.speaker_service.get_next_available_speaker_id()
                 saved_speaker_mapping[speaker] = new_speaker_id
                 
-                # 개별 임베딩 파일 저장 (로컬)
-                embedding_file = os.path.join(embeddings_dir, f"{new_speaker_id}_embeddings.pkl")
-                with open(embedding_file, 'wb') as f:
-                    pickle.dump(embeddings, f)
-                
                 # 평균 임베딩 계산 (화자 대표 벡터)
                 all_embeddings = np.array([emb['embedding'] for emb in embeddings])
                 mean_embedding = np.mean(all_embeddings, axis=0)
                 std_embedding = np.std(all_embeddings, axis=0)
                 
-                # 화자 프로파일 저장 (로컬)
+                # 화자 프로파일 데이터 생성
                 speaker_profile = {
                     'speaker_id': new_speaker_id,
                     'original_label': speaker,
@@ -382,12 +403,52 @@ class AudioProcessingService:
                     'sample_embeddings': embeddings[:3] if len(embeddings) > 3 else embeddings  # 샘플 저장
                 }
                 
-                profile_file = os.path.join(embeddings_dir, f"{new_speaker_id}_profile.pkl")
-                with open(profile_file, 'wb') as f:
-                    pickle.dump(speaker_profile, f)
+                # 환경 변수 확인 - local 환경일 때만 로컬 파일 저장
+                environment = os.getenv('ENVIRONMENT', 'production').lower()
+                embedding_file = None
+                profile_file = None
                 
-                # S3에 화자별 폴더로 업로드
-                self._upload_speaker_files_to_s3(new_speaker_id, embedding_file, profile_file)
+                if environment == 'local':
+                    print(f"🔧 로컬 환경 감지 - 로컬 파일 저장 진행: {new_speaker_id}")
+                    
+                    # 개별 임베딩 파일 저장 (로컬)
+                    embedding_file = os.path.join(embeddings_dir, f"{new_speaker_id}_embeddings.pkl")
+                    with open(embedding_file, 'wb') as f:
+                        pickle.dump(embeddings, f)
+                    
+                    # 화자 프로파일 저장 (로컬)
+                    profile_file = os.path.join(embeddings_dir, f"{new_speaker_id}_profile.pkl")
+                    with open(profile_file, 'wb') as f:
+                        pickle.dump(speaker_profile, f)
+                    
+                    print(f"✅ 로컬 파일 저장 완료: {new_speaker_id}")
+                else:
+                    print(f"🌐 운영 환경 감지 - 로컬 파일 저장 생략: {new_speaker_id}")
+                    
+                    # 임시 파일로 생성 (S3 업로드용)
+                    import tempfile
+                    
+                    # 임시 임베딩 파일 생성
+                    with tempfile.NamedTemporaryFile(suffix='_embeddings.pkl', delete=False) as temp_emb:
+                        pickle.dump(embeddings, temp_emb)
+                        embedding_file = temp_emb.name
+                    
+                    # 임시 프로파일 파일 생성
+                    with tempfile.NamedTemporaryFile(suffix='_profile.pkl', delete=False) as temp_prof:
+                        pickle.dump(speaker_profile, temp_prof)
+                        profile_file = temp_prof.name
+                
+                # S3에 화자별 폴더로 업로드 (항상 실행)
+                upload_success = self._upload_speaker_files_to_s3(new_speaker_id, embedding_file, profile_file)
+                
+                # 운영 환경에서는 임시 파일 정리
+                if environment != 'local':
+                    try:
+                        os.unlink(embedding_file)
+                        os.unlink(profile_file)
+                        print(f"🗑️ 임시 파일 정리 완료: {new_speaker_id}")
+                    except Exception as e:
+                        print(f"⚠️ 임시 파일 정리 실패: {e}")
                 
                 # DynamoDB에 화자 정보 저장 (기본 이름은 speaker_id)
                 result = self.speaker_service.create_or_update_speaker_name(new_speaker_id, new_speaker_id)
@@ -397,7 +458,13 @@ class AudioProcessingService:
                     print(f"✅ 화자 {new_speaker_id} DynamoDB 저장 완료: {result['action']}")
                 
                 total_embeddings += len(embeddings)
-                print(f"✅ {new_speaker_id} 프로파일 저장: {profile_file}")
+                
+                # 로그 출력 (로컬/운영 환경 구분)
+                if environment == 'local':
+                    print(f"✅ {new_speaker_id} 프로파일 저장: {profile_file}")
+                else:
+                    print(f"✅ {new_speaker_id} 프로파일 S3 업로드 완료")
+                    
                 print(f"   - 원본 라벨: {speaker}")
                 print(f"   - 세그먼트 수: {len(embeddings)}")
                 print(f"   - 총 발화 시간: {speaker_profile['total_duration']:.2f}초")
@@ -594,8 +661,12 @@ class AudioProcessingService:
                 # 가장 긴 세그먼트 선택
                 longest_segment = max(speaker_segments, key=lambda x: x['end'] - x['start'])
                 
-                # 대표 임베딩 추출
-                representative_embedding = self.extract_single_segment_embedding(audio_file, longest_segment)
+                # 대표 임베딩 추출 (최적화된 버전 - 오디오 데이터 재사용)
+                if 'shared_audio_data' not in locals():
+                    shared_audio_data, shared_sample_rate = librosa.load(audio_file, sr=16000)
+                representative_embedding = self.extract_single_segment_embedding(
+                    audio_file, longest_segment, shared_audio_data, shared_sample_rate
+                )
                 
                 if representative_embedding is None:
                     print(f"   ❌ 대표 임베딩 추출 실패")
@@ -724,16 +795,22 @@ class AudioProcessingService:
         return speaker_summary
     
     # 결과값 확인용 / 실제 서비스 시에는 필요하지 않은 기능
-    def save_transcript_to_file(self, results, speaker_summary, verified_speakers, processing_info):
+    def save_transcript_to_file(self, results, speaker_summary, verified_speakers, processing_info, upload_info=None):
         """STT 결과를 가독성 좋은 대화록 파일로 저장"""
         try:
             # 결과 디렉토리 생성
             result_dir = "temp/result"
             os.makedirs(result_dir, exist_ok=True)
             
-            # 파일명 생성 (타임스탬프 포함)
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            transcript_filename = f"transcript_{timestamp}.txt"
+            # 파일명 생성 (오디오 파일과 매칭되도록)
+            if upload_info and upload_info.get('timestamp') and upload_info.get('base_filename'):
+                # 오디오 파일명과 매칭: transcript_yyyymmdd_HHMMSS_원본파일명_임의값.txt
+                transcript_filename = f"transcript_{upload_info['timestamp']}_{upload_info['base_filename']}.txt"
+            else:
+                # fallback: 기존 방식
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                transcript_filename = f"transcript_{timestamp}.txt"
+            
             transcript_path = os.path.join(result_dir, transcript_filename)
             
             with open(transcript_path, 'w', encoding='utf-8') as f:
@@ -822,8 +899,8 @@ class AudioProcessingService:
             
             print(f"대화록 파일 저장 완료: {transcript_path}")
             
-            # S3에 대화록 파일 업로드 (오디오 파일과 동일한 경로 구조)
-            s3_transcript_path = self._upload_transcript_to_s3(transcript_path, timestamp)
+            # S3에 대화록 파일 업로드 (transcript 전용 경로에 저장)
+            s3_transcript_path = self._upload_transcript_to_s3(transcript_path, transcript_filename, upload_info)
             
             return transcript_path
             
@@ -831,17 +908,14 @@ class AudioProcessingService:
             print(f"대화록 파일 저장 중 오류: {e}")
             return None
     
-    def _upload_transcript_to_s3(self, transcript_path, timestamp):
-        """대화록 파일을 S3에 업로드 (오디오 파일과 동일한 경로 구조)"""
+    def _upload_transcript_to_s3(self, transcript_path, transcript_filename, upload_info=None):
+        """대화록 파일을 S3에 업로드 (transcript 전용 경로에 저장)"""
         try:
             from datetime import datetime
             now = datetime.now()
             
-            # 파일명 생성: transcript_yyyymmdd_HHMMSS.txt
-            transcript_filename = f"transcript_{timestamp}.txt"
-            
-            # S3 키 생성: audio/yyyy/mm/transcript_파일명 (오디오와 동일한 경로)
-            s3_key = f"audio/{now.strftime('%Y')}/{now.strftime('%m')}/{transcript_filename}"
+            # S3 키 생성: transcript/yyyy/mm/transcript_파일명 (오디오와 동일한 년/월 경로 구조)
+            s3_key = f"transcript/{now.strftime('%Y')}/{now.strftime('%m')}/{transcript_filename}"
             
             print(f"📤 대화록 파일 S3 업로드: {s3_key}")
             

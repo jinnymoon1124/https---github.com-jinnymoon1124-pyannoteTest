@@ -42,8 +42,8 @@ class AudioController(BaseController):
         # 파일 저장 및 변환
         original_file_path, converted_file_path = self._save_and_convert_file(file)
         
-        # 원본 파일을 S3에 업로드
-        self._upload_original_file_to_s3(original_file_path, file.filename)
+        # 원본 파일을 S3에 업로드 (파일명 정보 반환)
+        upload_info = self._upload_original_file_to_s3(original_file_path, file.filename)
         
         try:
             # 화자 분리 처리
@@ -76,10 +76,10 @@ class AudioController(BaseController):
                 total_time, diarization_time, stt_time, verify_time
             )
             
-            # 대화록 파일 저장
+            # 대화록 파일 저장 (오디오 파일 정보와 함께 전달)
             print("대화록 파일 저장 중...")
             transcript_path = self.audio_service.save_transcript_to_file(
-                results, speaker_summary, verified_speakers, response_data["processing_info"]
+                results, speaker_summary, verified_speakers, response_data["processing_info"], upload_info
             )
             
             # 응답 데이터에 대화록 파일 경로 추가
@@ -128,8 +128,8 @@ class AudioController(BaseController):
             import uuid
             random_value = str(uuid.uuid4())[:8]
             
-            # 파일명 생성: yyyymmdd_원본파일명_임의값.확장자
-            new_filename = f"{now.strftime('%Y%m%d')}_{filename_without_ext}_{random_value}{file_ext}"
+            # 파일명 생성: yyyymmdd_HHMMSS_원본파일명_임의값.확장자 (시간 추가로 transcript와 매칭 가능)
+            new_filename = f"{now.strftime('%Y%m%d_%H%M%S')}_{filename_without_ext}_{random_value}{file_ext}"
             
             # S3 키 생성: audio/yyyy/mm/파일명
             s3_key = f"audio/{now.strftime('%Y')}/{now.strftime('%m')}/{new_filename}"
@@ -145,7 +145,9 @@ class AudioController(BaseController):
             
             if result['success']:
                 print(f"✅ 원본 파일 S3 업로드 완료: {s3_key}")
-                return s3_key
+                # 파일명에서 timestamp 추출하여 반환 (transcript 파일명 생성용)
+                timestamp = now.strftime('%Y%m%d_%H%M%S')
+                return {'s3_key': s3_key, 'timestamp': timestamp, 'base_filename': f"{filename_without_ext}_{random_value}"}
             else:
                 print(f"❌ 원본 파일 S3 업로드 실패: {result.get('error', 'Unknown error')}")
                 return None
