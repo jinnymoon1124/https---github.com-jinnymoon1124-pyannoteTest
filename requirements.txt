@@ -19,5 +19,9 @@ scipy>=1.10.0
 psutil>=5.9.0
 GPUtil>=1.4.0
 
+# AWS 및 환경 설정
+boto3>=1.34.0
+python-dotenv>=1.0.0
+
 # 기타 유틸리티
 # pickle5는 Python 3.13에서 불필요 (내장 pickle이 protocol 5 지원)

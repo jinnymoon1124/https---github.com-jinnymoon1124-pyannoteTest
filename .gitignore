@@ -3,3 +3,4 @@ temp/
 __pycache__/
 *.wav
 *.mp3
+.env

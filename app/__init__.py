@@ -21,9 +21,11 @@ def create_app():
     # Blueprint 등록
     from app.controllers.audio_controller import audio_bp
     from app.controllers.speaker_controller import speaker_bp
+    from app.controllers.s3_controller import s3_bp
     
     app.register_blueprint(audio_bp)
     app.register_blueprint(speaker_bp)
+    app.register_blueprint(s3_bp)
     
     # 기본 라우트 추가
     @app.route('/')
